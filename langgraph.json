@@ -1,0 +1,9 @@
+{
+  "dependencies": ["-r requirements.txt"],
+  "graphs": {
+    "ambient_agent": "app.agent:graph"
+  },
+  "env": [
+    "OPENAI_API_KEY"
+  ]
+}
