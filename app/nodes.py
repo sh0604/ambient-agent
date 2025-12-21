@@ -1,5 +1,5 @@
 # app/nodes.py
-from typing import Any, Dict
+from typing import TypedDict, Optional, Union, Literal, Dict, Any
 from .state import AgentState
 from langchain_openai import ChatOpenAI
 import json
@@ -9,6 +9,24 @@ logger = logging.getLogger(__name__)
 
 llm = ChatOpenAI(model="gpt-5.2")
 
+class HumanInterruptConfig(TypedDict):
+    allow_ignore: bool
+    allow_respond: bool
+    allow_edit: bool
+    allow_accept: bool
+
+class ActionRequest(TypedDict):
+    action: str
+    args: Dict[str, Any]
+
+class HumanInterrupt(TypedDict):
+    action_request: ActionRequest
+    config: HumanInterruptConfig
+    description: Optional[str]
+
+class HumanResponse(TypedDict):
+    type: Literal["accept", "ignore", "response", "edit"]
+    args: Union[None, str, ActionRequest, Dict[str, Any]]
 
 def load_kintone_mock(state: AgentState) -> AgentState:
     """anken_id から案件情報をモック取得するノード。
@@ -95,24 +113,48 @@ from langgraph.types import interrupt
 from .state import AgentState
 
 def review_updates(state: AgentState) -> AgentState:
-    payload = {
-        "anken_id": state["anken_id"],
-        "kintone_updates": state["kintone_updates"],
-        "notify_message": state["notify_message"],
+    # Agent Inbox に「何をレビューしてほしいか」を action_request として渡す
+    req: HumanInterrupt = {
+        "action_request": {
+            "action": "ReviewKintoneUpdates",
+            "args": {
+                "anken_id": state["anken_id"],
+                "kintone_updates": state["kintone_updates"],
+                "notify_message": state["notify_message"],
+            },
+        },
+        "config": {
+            "allow_ignore": True,
+            "allow_respond": True,
+            "allow_edit": True,
+            "allow_accept": True,
+        },
+        "description": "更新案を確認し、Accept / Edit / Respond / Ignore を選択してください。",
     }
 
-    # ここで停止。resume時に human_decision が返る
-    human_decision = interrupt(payload)
+    # interrupt() は HumanResponse の配列を返す想定（Inbox UI は長さ1が前提）
+    resp: HumanResponse = interrupt(req)[0]
 
-    # 期待する human_decision 例：
-    # {
-    #   "action": "approve" | "modify",
-    #   "kintone_updates": [...]  # modify の場合は修正後
-    # }
+    if resp["type"] == "ignore":
+        state["status"] = "ignored"
+        return state
 
-    if human_decision.get("action") == "modify":
-        state["kintone_updates"] = human_decision["kintone_updates"]
+    if resp["type"] == "response":
+        # 例：コメントだけ保存したい場合
+        state["human_comment"] = resp["args"]  # str を想定
+        state["status"] = "commented"
+        return state
 
+    if resp["type"] == "edit":
+        # edit の場合、args は ActionRequest（action + args）になる想定
+        # ここでは「修正後の kintone_updates」を受け取る設計にする
+        edited = resp["args"]
+        if isinstance(edited, dict) and "args" in edited and "kintone_updates" in edited["args"]:
+            state["kintone_updates"] = edited["args"]["kintone_updates"]
+        state["status"] = "edited"
+        return state
+
+    # accept
     state["status"] = "approved"
     return state
 
