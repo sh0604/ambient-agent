@@ -39,10 +39,42 @@ class RunIdCaptureHandler(BaseCallbackHandler):
     def on_llm_start(self, serialized, prompts, *, run_id, parent_run_id=None, **kwargs):
         self.run_id = run_id
 
-def _normalize_updates(updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _coerce_updates(value: Any) -> list[dict[str, Any]]:
+    """
+    kintone_updates を list[dict] に正規化する。
+    - すでに list[dict] → そのまま
+    - JSON文字列 → json.loads して解釈
+    - その他 → 空にする（PoCは安全側）
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        # list[str] など混在の可能性があるので dict だけ残す
+        return [v for v in value if isinstance(v, dict)]
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        try:
+            loaded = json.loads(s)
+        except json.JSONDecodeError:
+            return []
+        # {"kintone_updates":[...]} の形で返る可能性も吸収
+        if isinstance(loaded, dict) and "kintone_updates" in loaded:
+            loaded = loaded["kintone_updates"]
+        if isinstance(loaded, list):
+            return [v for v in loaded if isinstance(v, dict)]
+        return []
+    # dict単体で来るケースも念のため
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+def _normalize_updates(updates: Any) -> list[dict[str, Any]]:
     # field_code で安定ソートして差分を取りやすくする（PoC用）
+    updates_list = _coerce_updates(updates)
     return sorted(
-        [{"field_code": u.get("field_code"), "value": u.get("value")} for u in (updates or [])],
+        [{"field_code": u.get("field_code"), "value": u.get("value")} for u in updates_list],
         key=lambda x: (x.get("field_code") or ""),
     )
 
@@ -211,10 +243,16 @@ def review_updates(state: AgentState) -> AgentState:
         # ここでは「修正後の kintone_updates」を受け取る設計にする
         edited = resp["args"]
         if isinstance(edited, dict) and "args" in edited:
+            raw = edited["args"].get("kintone_updates")
             if "kintone_updates" in edited["args"]:
-                state["kintone_updates"] = edited["args"]["kintone_updates"]
+                state["kintone_updates"] = _coerce_updates(edited["args"]["kintone_updates"])
             if "notify_message" in edited["args"]:
                 state["notify_message"] = edited["args"]["notify_message"]
+        logger.info(
+            "[review_updates] raw kintone_updates type=%s snippet=%s",
+            type(raw).__name__,
+            (str(raw)[:200] if raw is not None else "None"),
+        )
         state["status"] = "edited"
     elif resp["type"] == "accept":
         state["status"] = "approved"
@@ -226,12 +264,12 @@ def review_updates(state: AgentState) -> AgentState:
         f"[review_updates] will_write_feedback run_id={state.get('ls_run_id')} decision={decision}"
     )
 
-    final_updates = state.get("kintone_updates", [])
-    final_notify = state.get("notify_message", "")
-
     run_id = state.get("ls_run_id")
     if run_id:
         try:
+            proposed_updates = _coerce_updates(proposed_updates)
+            final_updates = _coerce_updates(final_updates)
+            
             diff = _diff_updates(proposed_updates, final_updates)
 
             ls_client.create_feedback(run_id, key="human_decision", value=decision)
