@@ -2,12 +2,16 @@
 from typing import TypedDict, Optional, Union, Literal, Dict, Any
 from .state import AgentState
 from langchain_openai import ChatOpenAI
+from langchain_core.callbacks import BaseCallbackHandler
+from langsmith import Client
 import json
 import logging
 
 logger = logging.getLogger(__name__)
 
 llm = ChatOpenAI(model="gpt-5.2")
+
+ls_client = Client()
 
 class HumanInterruptConfig(TypedDict):
     allow_ignore: bool
@@ -27,6 +31,29 @@ class HumanInterrupt(TypedDict):
 class HumanResponse(TypedDict):
     type: Literal["accept", "ignore", "response", "edit"]
     args: Union[None, str, ActionRequest, Dict[str, Any]]
+
+class RunIdCaptureHandler(BaseCallbackHandler):
+    def __init__(self):
+        self.run_id = None
+
+    def on_llm_start(self, serialized, prompts, *, run_id, parent_run_id=None, **kwargs):
+        self.run_id = run_id
+
+def _normalize_updates(updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # field_code で安定ソートして差分を取りやすくする（PoC用）
+    return sorted(
+        [{"field_code": u.get("field_code"), "value": u.get("value")} for u in (updates or [])],
+        key=lambda x: (x.get("field_code") or ""),
+    )
+
+def _diff_updates(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[str, Any]:
+    b = {u["field_code"]: u.get("value") for u in _normalize_updates(before) if u.get("field_code")}
+    a = {u["field_code"]: u.get("value") for u in _normalize_updates(after) if u.get("field_code")}
+    changed = []
+    for fc in sorted(set(b.keys()) | set(a.keys())):
+        if b.get(fc) != a.get(fc):
+            changed.append({"field_code": fc, "before": b.get(fc), "after": a.get(fc)})
+    return {"changed_fields": changed}
 
 def load_kintone_mock(state: AgentState) -> AgentState:
     """anken_id から案件情報をモック取得するノード。
@@ -94,19 +121,27 @@ kintone現在レコード:
   "notify_message": "案件 ANKEN-123 の事前審査結果が『否決』でした。"
 }}
 """
+    
+    runid_handler = RunIdCaptureHandler()
 
     resp = llm.invoke(
         [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        config={"tags": tags, "metadata": metadata},
+        config={"tags": tags, "metadata": metadata, "callbacks": [runid_handler],},
     )
+
+    if runid_handler.run_id:
+        state["ls_run_id"] = str(runid_handler.run_id)
 
     parsed = json.loads(resp.content)
 
     state["kintone_updates"] = parsed["kintone_updates"]
     state["notify_message"] = parsed["notify_message"]
+
+    state["proposed_kintone_updates"] = parsed["kintone_updates"]
+    state["proposed_notify_message"] = parsed["notify_message"]
 
     # ここで「HITL 前の提案である」ことを明示する
     state["status"] = "ready_for_review"
@@ -160,18 +195,51 @@ def review_updates(state: AgentState) -> AgentState:
         state["human_comment"] = resp["args"]  # str を想定
         state["status"] = "commented"
         return state
+    
+    # ★ここから：edit / accept を LangSmith feedback に記録する
+    proposed_updates = state.get("proposed_kintone_updates", state.get("kintone_updates", []))
+    proposed_notify = state.get("proposed_notify_message", state.get("notify_message", ""))
+
+    final_updates = state.get("kintone_updates", [])
+    final_notify = state.get("notify_message", "")
+
+    decision = resp["type"]  # "edit" or "accept" になる想定
 
     if resp["type"] == "edit":
         # edit の場合、args は ActionRequest（action + args）になる想定
         # ここでは「修正後の kintone_updates」を受け取る設計にする
         edited = resp["args"]
-        if isinstance(edited, dict) and "args" in edited and "kintone_updates" in edited["args"]:
-            state["kintone_updates"] = edited["args"]["kintone_updates"]
+        if isinstance(edited, dict) and "args" in edited:
+            if "kintone_updates" in edited["args"]:
+                state["kintone_updates"] = edited["args"]["kintone_updates"]
+            if "notify_message" in edited["args"]:
+                state["notify_message"] = edited["args"]["notify_message"]
         state["status"] = "edited"
+    elif resp["type"] == "accept":
+        state["status"] = "approved"
+    else:
+        state["status"] = "unknown_decision"
         return state
 
-    # accept
-    state["status"] = "approved"
+    final_updates = state.get("kintone_updates", [])
+    final_notify = state.get("notify_message", "")
+
+    run_id = state.get("ls_run_id")
+    if run_id:
+        try:
+            diff = _diff_updates(proposed_updates, final_updates)
+
+            ls_client.create_feedback(run_id, key="human_decision", value=decision)
+            ls_client.create_feedback(
+                run_id,
+                key="final_kintone_updates",
+                value={"kintone_updates": final_updates, "notify_message": final_notify},
+            )
+            ls_client.create_feedback(run_id, key="update_diff", value=diff)
+
+        except Exception:
+            logger.exception("[review_updates] failed to write LangSmith feedback")
+
     return state
 
 def apply_updates(state: AgentState) -> AgentState:

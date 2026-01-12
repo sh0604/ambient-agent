@@ -18,6 +18,13 @@ class AgentState(TypedDict, total=False):
     kintone_updates: List[Dict[str, Any]]  # 例: {"field_code": "事前審査結果", "value": "否決"}
     notify_message: str
 
+    # ★追加：LangSmith run_id（propose_updates の LLM 実行に紐づける）
+    ls_run_id: str
+
+    # ★追加：提案時点の原案（差分算出に使う）
+    proposed_kintone_updates: List[Dict[str, Any]]
+    proposed_notify_message: str
+
     # ★追加：簡易バリデーション結果
     validation_ok: bool
     validation_errors: List[str]
