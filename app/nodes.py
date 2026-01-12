@@ -54,6 +54,21 @@ def propose_updates(state: AgentState) -> AgentState:
     result = state["mortgage_preliminary_result"]
     record = state["kintone_current_record"]
 
+    # ★追加：trace用のメタデータ（PoCは固定でOK）
+    anken_id = state.get("anken_id")
+    bank_name = (result or {}).get("金融機関名")
+    schema_version = "loan_app_schema_v0"
+
+    tags = [
+        "node:propose_updates",
+        f"bank:{bank_name}" if bank_name else "bank:unknown",
+    ]
+    metadata = {
+        "anken_id": anken_id,
+        "bank_name": bank_name,
+        "schema_version": schema_version,
+    }
+
     system = (
         "あなたは住宅ローン案件のオペレーション担当です。"
         "kintone の案件情報を、事前審査結果にしたがって更新する『提案』を JSON で出力してください。"
@@ -84,7 +99,8 @@ kintone現在レコード:
         [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
-        ]
+        ],
+        config={"tags": tags, "metadata": metadata},
     )
 
     parsed = json.loads(resp.content)
