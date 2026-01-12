@@ -148,6 +148,7 @@ kintone現在レコード:
     state["needs_human_review"] = True
 
     logger.info(f"[propose_updates] kintone_updates proposal: {state['kintone_updates']}")
+    logger.info(f"[propose_updates] captured ls_run_id={state.get('ls_run_id')}")
     return state
 
 
@@ -220,6 +221,10 @@ def review_updates(state: AgentState) -> AgentState:
     else:
         state["status"] = "unknown_decision"
         return state
+    
+    logger.info(
+        f"[review_updates] will_write_feedback run_id={state.get('ls_run_id')} decision={decision}"
+    )
 
     final_updates = state.get("kintone_updates", [])
     final_notify = state.get("notify_message", "")
