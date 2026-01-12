@@ -87,6 +87,36 @@ def _diff_updates(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> 
             changed.append({"field_code": fc, "before": b.get(fc), "after": a.get(fc)})
     return {"changed_fields": changed}
 
+def _extract_edited_payload(resp_args: Any) -> dict[str, Any]:
+    """
+    Agent Inbox から返ってくる edit payload の揺れを吸収して、
+    {"kintone_updates": ..., "notify_message": ...} の形に正規化する。
+    """
+    if resp_args is None:
+        return {}
+
+    # 1) 文字列で JSON が来るケース
+    if isinstance(resp_args, str):
+        try:
+            loaded = json.loads(resp_args)
+            # list なら kintone_updates とみなす
+            if isinstance(loaded, list):
+                return {"kintone_updates": loaded}
+            if isinstance(loaded, dict):
+                return loaded
+        except json.JSONDecodeError:
+            return {}
+
+    # 2) dict のケース
+    if isinstance(resp_args, dict):
+        # ActionRequest 形式 {"action": "...", "args": {...}}
+        if "args" in resp_args and isinstance(resp_args["args"], dict):
+            return resp_args["args"]
+        # すでに args 本体が入っている
+        return resp_args
+
+    return {}
+
 def load_kintone_mock(state: AgentState) -> AgentState:
     """anken_id から案件情報をモック取得するノード。
     ここではまだ kintone 本体は更新しない。
@@ -233,32 +263,40 @@ def review_updates(state: AgentState) -> AgentState:
     proposed_updates = state.get("proposed_kintone_updates", state.get("kintone_updates", []))
     proposed_notify = state.get("proposed_notify_message", state.get("notify_message", ""))
 
-    final_updates = state.get("kintone_updates", [])
-    final_notify = state.get("notify_message", "")
-
     decision = resp["type"]  # "edit" or "accept" になる想定
 
     if resp["type"] == "edit":
-        # edit の場合、args は ActionRequest（action + args）になる想定
-        # ここでは「修正後の kintone_updates」を受け取る設計にする
-        edited = resp["args"]
-        if isinstance(edited, dict) and "args" in edited:
-            raw = edited["args"].get("kintone_updates")
-            if "kintone_updates" in edited["args"]:
-                state["kintone_updates"] = _coerce_updates(edited["args"]["kintone_updates"])
-            if "notify_message" in edited["args"]:
-                state["notify_message"] = edited["args"]["notify_message"]
+        edited_payload = _extract_edited_payload(resp["args"])
+        raw_updates = edited_payload.get("kintone_updates")
+        raw_notify = edited_payload.get("notify_message")
+
         logger.info(
             "[review_updates] raw kintone_updates type=%s snippet=%s",
-            type(raw).__name__,
-            (str(raw)[:200] if raw is not None else "None"),
+            type(raw_updates).__name__,
+            (str(raw_updates)[:200] if raw_updates is not None else "None"),
         )
+
+        if raw_updates is not None:
+            state["kintone_updates"] = _coerce_updates(raw_updates)
+        if raw_notify is not None:
+            state["notify_message"] = str(raw_notify)
+
+        logger.info(
+            "[review_updates] coerced kintone_updates=%s",
+            state.get("kintone_updates"),
+        )
+
         state["status"] = "edited"
+
     elif resp["type"] == "accept":
         state["status"] = "approved"
+
     else:
         state["status"] = "unknown_decision"
         return state
+    
+    final_updates = state.get("kintone_updates", [])
+    final_notify = state.get("notify_message", "")
     
     logger.info(
         f"[review_updates] will_write_feedback run_id={state.get('ls_run_id')} decision={decision}"
@@ -269,7 +307,7 @@ def review_updates(state: AgentState) -> AgentState:
         try:
             proposed_updates = _coerce_updates(proposed_updates)
             final_updates = _coerce_updates(final_updates)
-            
+
             diff = _diff_updates(proposed_updates, final_updates)
 
             ls_client.create_feedback(run_id, key="human_decision", value=decision)
