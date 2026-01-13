@@ -286,6 +286,8 @@ def review_updates(state: AgentState) -> AgentState:
             state.get("kintone_updates"),
         )
 
+        state["review_diff"] = diff
+        state["review_final"] = {"kintone_updates": final_updates, "notify_message": final_notify}
         state["status"] = "edited"
 
     elif resp["type"] == "accept":
