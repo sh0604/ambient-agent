@@ -296,6 +296,7 @@ def review_updates(state: AgentState) -> AgentState:
         return state
     
     # ここで「最終値」を確定させてから diff を作る
+    proposed_updates_raw = state.get("proposed_kintone_updates", [])
     final_updates_raw = state.get("kintone_updates", [])
     final_notify = state.get("notify_message", "")
 
@@ -304,7 +305,6 @@ def review_updates(state: AgentState) -> AgentState:
 
     diff = _diff_updates(proposed_updates, final_updates)
 
-    # ★2つ目トレース（review_updates ノードの出力）に必ず載る
     state["review_diff"] = diff
     state["review_final"] = {"kintone_updates": final_updates, "notify_message": final_notify}
 
