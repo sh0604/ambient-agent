@@ -286,8 +286,6 @@ def review_updates(state: AgentState) -> AgentState:
             state.get("kintone_updates"),
         )
 
-        state["review_diff"] = diff
-        state["review_final"] = {"kintone_updates": final_updates, "notify_message": final_notify}
         state["status"] = "edited"
 
     elif resp["type"] == "accept":
@@ -297,21 +295,29 @@ def review_updates(state: AgentState) -> AgentState:
         state["status"] = "unknown_decision"
         return state
     
-    final_updates = state.get("kintone_updates", [])
+    # ここで「最終値」を確定させてから diff を作る
+    final_updates_raw = state.get("kintone_updates", [])
     final_notify = state.get("notify_message", "")
-    
+
+    proposed_updates = _coerce_updates(proposed_updates_raw)
+    final_updates = _coerce_updates(final_updates_raw)
+
+    diff = _diff_updates(proposed_updates, final_updates)
+
+    # ★2つ目トレース（review_updates ノードの出力）に必ず載る
+    state["review_diff"] = diff
+    state["review_final"] = {"kintone_updates": final_updates, "notify_message": final_notify}
+
     logger.info(
-        f"[review_updates] will_write_feedback run_id={state.get('ls_run_id')} decision={decision}"
+        "[review_updates] computed diff changed_fields=%d",
+        len(diff.get("changed_fields", [])),
     )
 
     run_id = state.get("ls_run_id")
+    logger.info("[review_updates] will_write_feedback run_id=%s decision=%s", run_id, decision)
+
     if run_id:
         try:
-            proposed_updates = _coerce_updates(proposed_updates)
-            final_updates = _coerce_updates(final_updates)
-
-            diff = _diff_updates(proposed_updates, final_updates)
-
             ls_client.create_feedback(run_id, key="human_decision", value=decision)
             ls_client.create_feedback(
                 run_id,
@@ -319,7 +325,6 @@ def review_updates(state: AgentState) -> AgentState:
                 value={"kintone_updates": final_updates, "notify_message": final_notify},
             )
             ls_client.create_feedback(run_id, key="update_diff", value=diff)
-
         except Exception:
             logger.exception("[review_updates] failed to write LangSmith feedback")
 
