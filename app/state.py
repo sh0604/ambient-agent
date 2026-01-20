@@ -8,30 +8,40 @@ class AgentState(TypedDict, total=False):
     anken_id: str
     mortgage_preliminary_result: Dict[str, Any]
 
+    # ocr_content（= mortgage_preliminary_result を JSON 文字列化したもの）
+    ocr_content: str
+
     # コンテキスト（ローン申込アプリの現在レコード）
     kintone_current_record: Dict[str, Any]
 
-    # ★追加：アプリ設計情報（フィールド定義など）
-    kintone_app_schema: Dict[str, Any]  # { "app_id": "...", "fields": { field_code: {type,label,...}, ... } }
+    # アプリ設計情報（フィールド定義など）
+    kintone_app_schema: Dict[str, Any]
 
     # エージェントが作る「提案」
-    kintone_updates: List[Dict[str, Any]]  # 例: {"field_code": "事前審査結果", "value": "否決"}
+    kintone_updates: List[Dict[str, Any]]
     notify_message: str
 
-    # ★追加：LangSmith run_id（propose_updates の LLM 実行に紐づける）
+    # LangSmith run_id
     ls_run_id: str
 
-    # ★追加：提案時点の原案（差分算出に使う）
+    # 提案時点の原案（差分算出に使う）
     proposed_kintone_updates: List[Dict[str, Any]]
     proposed_notify_message: str
 
-    # ★追加：簡易バリデーション結果
-    validation_ok: bool
-    validation_errors: List[str]
+    # レビュー結果
+    review_diff: Dict[str, Any]
+    review_final: Dict[str, Any]
+
+    # --- Dataset登録用（あなたの input schema に対応）---
+    bank: str
+    prompt_text: str
+    dataset_propose_payload: str
+    fetch_kintone_record: str
+    dataset_after_review: str
 
     # 管理用
-    status: str              # "ready_for_review" 等
+    status: str
     needs_human_review: bool
 
-    applied: bool  # kintone 更新が適用済みかどうか
+    applied: bool
     human_comment: Optional[str]
