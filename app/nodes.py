@@ -51,6 +51,57 @@ class RunIdCaptureHandler(BaseCallbackHandler):
     def on_llm_start(self, serialized, prompts, *, run_id, parent_run_id=None, **kwargs):
         self.run_id = run_id
 
+def _get_recent_edit_examples(dataset_id: str, k: int = 3) -> list[dict[str, Any]]:
+    # 例：decision が outputs に入っている前提
+    # 取得件数は多め→ローカルで絞る方が安全
+    examples = list(ls_client.list_examples(dataset_id=dataset_id, limit=50))
+    edit_only = []
+    for ex in examples:
+        outputs = ex.outputs or {}
+        if outputs.get("decision") == "edit":
+            edit_only.append(ex)
+
+    # created_atで新しい順に
+    edit_only.sort(key=lambda e: getattr(e, "created_at", 0) or 0, reverse=True)
+    return edit_only[:k]
+
+
+def _summarize_edit_patterns(examples: list[Any]) -> str:
+    # LLMに投げる用に整形（diff / final_payloadを中心に）
+    items = []
+    for ex in examples:
+        inputs = ex.inputs or {}
+        outputs = ex.outputs or {}
+        items.append({
+            "doc_type": inputs.get("doc_type"),
+            "diff": outputs.get("diff") or inputs.get("diff"),
+            "final_payload": inputs.get("final_payload"),
+        })
+
+    system = (
+        "あなたは業務ルールの分析者です。"
+        "以下は直近の人手編集（AI提案→人が修正した結果）の記録です。"
+        "今後AIが提案を作る際に守るべき『編集傾向ルールTop3』を日本語で簡潔に箇条書きで出してください。"
+        "曖昧なら『よく編集されるポイント』として一般化してよい。"
+    )
+    user = json.dumps(items, ensure_ascii=False)
+
+    resp = llm.invoke([{"role": "system", "content": system},
+                       {"role": "user", "content": user}])
+    return resp.content.strip()
+
+
+def _get_edit_patterns_summary(state: AgentState) -> str:
+    if not DATASET_ID:
+        return ""
+    try:
+        examples = _get_recent_edit_examples(DATASET_ID, k=3)
+        if not examples:
+            return ""
+        return _summarize_edit_patterns(examples)
+    except Exception:
+        logger.exception("[patterns] failed to build edit patterns summary")
+        return ""
 
 def _coerce_updates(value: Any) -> list[dict[str, Any]]:
     if value is None:
@@ -127,38 +178,46 @@ def _maybe_add_example_to_dataset(state: AgentState, diff: dict[str, Any]) -> No
         logger.warning("[dataset] LANGCHAIN_DATASET_ID is not set; skip")
         return
 
-    changed = diff.get("changed_fields", [])
-    if not changed:
-        return
+    # --- 必須入力を schema に合わせて作る（すべて文字列で統一） ---
+    anken_id = str(state.get("anken_id", ""))
+    doc_type = str(state.get("doc_type", "preliminary_result"))  # 未設定なら暫定固定でOK
 
-    after_review_payload = {
+    kintone_current_record_str = _json_dumps_safe(state.get("kintone_current_record", {}))
+    mortgage_preliminary_result_str = _json_dumps_safe(state.get("mortgage_preliminary_result", {}))
+
+    prompt_text = str(state.get("prompt_text", ""))
+
+    proposed_payload_str = str(state.get("dataset_propose_payload", ""))  # 既にJSON文字列
+    # final_payload は review_final（確定値）を入れるのが自然
+    final_payload_str = _json_dumps_safe(state.get("review_final", {
         "kintone_updates": state.get("kintone_updates", []),
-        "notify_message": state.get("notify_message", ""),
-        "diff": diff,
-    }
-    after_review_str = _json_dumps_safe(after_review_payload)
-    state["dataset_after_review"] = after_review_str
+        "notify_message": state.get("notify_message", "")
+    }))
+
+    human_comment = str(state.get("human_comment", "") or "")
 
     inputs = {
-        "bank": str(state.get("bank", "unknown")),
-        "prompt": str(state.get("prompt_text", "")),
-        "propose": str(state.get("dataset_propose_payload", "")),
-        # ✅ ocr_content は mortgage_preliminary_result の JSON 文字列
-        "ocr_content": str(state.get("ocr_content", "")),
-        "after_review": after_review_str,
-        "fetch_kintone_record": str(state.get("fetch_kintone_record", "")),
+        "anken_id": anken_id,
+        "doc_type": doc_type,
+        "kintone_current_record": kintone_current_record_str,
+        "mortgage_preliminary_result": mortgage_preliminary_result_str,
+        "prompt_text": prompt_text,
+        "proposed_payload": proposed_payload_str,
+        "final_payload": final_payload_str,
+        "human_comment": human_comment,
     }
 
     outputs = {
-        "changed_fields_count": len(changed),
-        "label": "diff_exists",
+        "decision": "edit" if state.get("status") == "edited" else "accept",
+        "has_diff": bool((diff or {}).get("changed_fields")),
+        "diff": _json_dumps_safe(diff or {}),
     }
 
     metadata = {
         "ls_run_id": state.get("ls_run_id"),
         "anken_id": state.get("anken_id"),
-        "decision": state.get("status"),
-        "bank_name": state.get("bank"),
+        "status": state.get("status"),
+        "schema_version": "loan_app_schema_v0",
     }
 
     try:
@@ -168,10 +227,9 @@ def _maybe_add_example_to_dataset(state: AgentState, diff: dict[str, Any]) -> No
             outputs=outputs,
             metadata=metadata,
         )
-        logger.info("[dataset] added example dataset_id=%s changed=%d", DATASET_ID, len(changed))
+        logger.info("[dataset] added example dataset_id=%s", DATASET_ID)
     except Exception:
         logger.exception("[dataset] failed to create_example")
-
 
 def load_kintone_mock(state: AgentState) -> AgentState:
     anken_id = state["anken_id"]
@@ -208,12 +266,15 @@ def propose_updates(state: AgentState) -> AgentState:
         "schema_version": schema_version,
     }
 
+    patterns = _get_edit_patterns_summary(state)
+
     system = (
         "あなたは住宅ローン案件のオペレーション担当です。"
         "kintone の案件情報を、事前審査結果にしたがって更新する『提案』を JSON で出力してください。"
         "この出力はあくまで人間がレビューする前提の下書きであり、"
         "あなた自身がkintoneを直接更新することはありません。"
         "JSON 以外の文字は出力しないでください。"
+        + ("\n\n【直近の人手編集傾向（参考）】\n" + patterns if patterns else "")
     )
 
     user = f"""
@@ -292,22 +353,49 @@ def review_updates(state: AgentState) -> AgentState:
         "description": "更新案を確認し、Accept / Edit / Respond / Ignore を選択してください。",
     }
 
-    resp: HumanResponse = interrupt(req)[0]
+    resp: HumanResponse = interrupt(req)
+    logger.info("[review_updates] human resp=%s", resp)
 
-    if resp["type"] == "ignore":
-        state["status"] = "ignored"
-        return state
+    run_id = state.get("ls_run_id")
 
-    if resp["type"] == "response":
-        state["human_comment"] = resp["args"]  # str想定
-        state["status"] = "commented"
-        return state
+    # ★ 上書き混乱を避けるため、keyを分ける（human_decision → review.decision）
+    def _fb(key: str, value: Any) -> None:
+        if not run_id:
+            return
+        try:
+            ls_client.create_feedback(run_id, key=key, value=value)
+        except Exception:
+            logger.exception("[review_updates] failed to write feedback key=%s", key)
 
+    rtype = resp.get("type")
+
+    match rtype:
+        case "ignore":
+            state["status"] = "ignored"
+            _fb("review.decision", "ignore")
+            return state
+
+        case "response":
+            state["human_comment"] = resp.get("args")
+            state["status"] = "commented"
+            _fb("review.decision", "response")
+            _fb("review.comment", state.get("human_comment", ""))
+            return state
+
+        case "accept" | "edit":
+            decision = rtype  # accept or edit
+
+        case _:
+            state["status"] = "unknown_decision"
+            _fb("review.decision", str(rtype))
+            _fb("review.error", "unknown_decision")
+            return state
+
+    # --- ここから accept/edit のみ ---
     proposed_updates = state.get("proposed_kintone_updates", state.get("kintone_updates", []))
-    decision = resp["type"]  # "edit" or "accept"
 
-    if resp["type"] == "edit":
-        edited_payload = _extract_edited_payload(resp["args"])
+    if decision == "edit":
+        edited_payload = _extract_edited_payload(resp.get("args"))
         raw_updates = edited_payload.get("kintone_updates")
         raw_notify = edited_payload.get("notify_message")
 
@@ -317,13 +405,8 @@ def review_updates(state: AgentState) -> AgentState:
             state["notify_message"] = str(raw_notify)
 
         state["status"] = "edited"
-
-    elif resp["type"] == "accept":
-        state["status"] = "approved"
-
     else:
-        state["status"] = "unknown_decision"
-        return state
+        state["status"] = "approved"
 
     proposed_updates_list = _coerce_updates(proposed_updates)
     final_updates_list = _coerce_updates(state.get("kintone_updates", []))
@@ -337,25 +420,16 @@ def review_updates(state: AgentState) -> AgentState:
         "notify_message": final_notify,
     }
 
-    run_id = state.get("ls_run_id")
-    if run_id:
-        try:
-            ls_client.create_feedback(run_id, key="human_decision", value=decision)
-            ls_client.create_feedback(
-                run_id,
-                key="final_kintone_updates",
-                value={"kintone_updates": final_updates_list, "notify_message": final_notify},
-            )
-            ls_client.create_feedback(run_id, key="update_diff", value=diff)
-            ls_client.create_feedback(run_id, key="has_diff", value=bool(diff.get("changed_fields")))
-        except Exception:
-            logger.exception("[review_updates] failed to write LangSmith feedback")
+    # Feedback（accept/edit）
+    _fb("review.decision", decision)
+    _fb("review.final", {"kintone_updates": final_updates_list, "notify_message": final_notify})
+    _fb("review.diff", diff)
+    _fb("review.has_diff", bool(diff.get("changed_fields")))
 
-    # ✅ diff がある場合だけ Dataset 登録
+    # Dataset（accept/edit のみ）
     _maybe_add_example_to_dataset(state, diff)
 
     return state
-
 
 def apply_updates(state: AgentState) -> AgentState:
     state["applied"] = True
